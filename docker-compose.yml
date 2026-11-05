@@ -1,0 +1,218 @@
+
+name: vibecheck
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-vibecheck}
+      POSTGRES_USER: ${POSTGRES_USER:-vibecheck}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vibecheck} -d ${POSTGRES_DB:-vibecheck}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+    networks:
+      - app
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command:
+      - redis-server
+      - --appendonly
+      - "yes"
+      - --requirepass
+      - ${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - 'REDISCLI_AUTH="$${REDIS_PASSWORD}" redis-cli ping | grep -q "^PONG$"'
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - app
+
+  egress-proxy:
+    build: ./egress-proxy
+    restart: unless-stopped
+    expose:
+      - "8888"
+    networks:
+      app: {}
+      egress:
+        gw_priority: 1
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import socket; s=socket.create_connection(('127.0.0.1',8888),2); s.close()"
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: ./backend
+    restart: unless-stopped
+    entrypoint:
+      - /bin/sh
+      - -c
+      - python manage.py migrate --noinput && python manage.py collectstatic --noinput && exec gunicorn config.wsgi:application --bind=0.0.0.0:8000 --workers=3 --timeout=120 --access-logfile=- --error-logfile=-
+    environment: &backend_env
+      DJANGO_SECRET_KEY: ${DJANGO_SECRET_KEY:?Set DJANGO_SECRET_KEY in .env}
+      DJANGO_DEBUG: ${DJANGO_DEBUG:-false}
+      DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,api}
+      CSRF_TRUSTED_ORIGINS: ${CSRF_TRUSTED_ORIGINS:-http://localhost:3000}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-http://localhost:3000}
+
+      DATABASE_URL: postgresql://${POSTGRES_USER:-vibecheck}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-vibecheck}
+      DATABASE_SSL_REQUIRE: ${DATABASE_SSL_REQUIRE:-false}
+
+      CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      CELERY_RESULT_BACKEND: redis://:${REDIS_PASSWORD}@redis:6379/1
+
+      EGRESS_PROXY_URL: http://egress-proxy:8888
+      HTTP_PROXY: http://egress-proxy:8888
+      HTTPS_PROXY: http://egress-proxy:8888
+      http_proxy: http://egress-proxy:8888
+      https_proxy: http://egress-proxy:8888
+
+      NO_PROXY: localhost,127.0.0.1,api,db,redis,egress-proxy,frontend
+      no_proxy: localhost,127.0.0.1,api,db,redis,egress-proxy,frontend
+
+      MEDIA_ROOT: /app/media
+      TIME_ZONE: ${TIME_ZONE:-Europe/Berlin}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      JWT_ACCESS_MINUTES: ${JWT_ACCESS_MINUTES:-15}
+      JWT_REFRESH_DAYS: ${JWT_REFRESH_DAYS:-7}
+
+      SECURE_SSL_REDIRECT: ${SECURE_SSL_REDIRECT:-false}
+      SECURE_HSTS_SECONDS: ${SECURE_HSTS_SECONDS:-31536000}
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      CSRF_COOKIE_SECURE: ${CSRF_COOKIE_SECURE:-false}
+
+      HOME: /tmp
+      TMPDIR: /tmp
+      XDG_CACHE_HOME: /tmp/.cache
+
+    volumes:
+      - media_data:/app/media
+    expose:
+      - "8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      egress-proxy:
+        condition: service_healthy
+    networks:
+      - app
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; opener=urllib.request.build_opener(urllib.request.ProxyHandler({})); response=opener.open('http://127.0.0.1:8000/health/', timeout=3); assert response.status == 200"
+      interval: 15s
+      timeout: 5s
+      retries: 8
+      start_period: 45s
+
+  worker:
+    build: ./backend
+    restart: unless-stopped
+    command:
+      - celery
+      - -A
+      - config
+      - worker
+      - --loglevel=INFO
+      - --concurrency=2
+      - --prefetch-multiplier=1
+    environment: *backend_env
+    volumes:
+      - media_data:/app/media
+    depends_on:
+      api:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      egress-proxy:
+        condition: service_healthy
+    networks:
+      - app
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:size=1g,mode=1777
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "celery -A config inspect ping -d celery@$$HOSTNAME -t 5 | grep -q pong"
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 35s
+
+  frontend:
+    build: ./frontend
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      BACKEND_INTERNAL_URL: http://api:8000
+      AUTH_COOKIE_SECURE: ${AUTH_COOKIE_SECURE:-false}
+      JWT_ACCESS_MINUTES: ${JWT_ACCESS_MINUTES:-15}
+      JWT_REFRESH_DAYS: ${JWT_REFRESH_DAYS:-7}
+    ports:
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      app: {}
+      frontend-ingress:
+        gw_priority: 1
+
+volumes:
+  postgres_data:
+  redis_data:
+  media_data:
+
+networks:
+  app:
+    driver: bridge
+    internal: true
+
+  egress:
+    driver: bridge
+
+  frontend-ingress:
+    driver: bridge
